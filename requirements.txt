@@ -8,3 +8,4 @@ huggingface_hub
 wandb
 openai
 trl
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
