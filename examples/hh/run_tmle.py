@@ -19,18 +19,20 @@ project_root = os.path.abspath(os.path.join(current_dir, "../.."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# [Standard Imports] 不再需要 unsloth
 from trl import ScriptArguments, ModelConfig, get_quantization_config, get_kbit_device_map
 from transformers import (
     AutoModelForCausalLM, 
     AutoModelForSequenceClassification, 
     AutoTokenizer, 
-    HfArgumentParser
+    HfArgumentParser,
+    BitsAndBytesConfig # 用于 4-bit 量化
 )
-from unsloth import FastLanguageModel
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trainer.drpo_config import DRPOConfig
 
 # ==============================================================================
-# [NEW] 自定义实验参数
+# Arguments
 # ==============================================================================
 @dataclass
 class ExperimentArgs:
@@ -72,6 +74,7 @@ class SafeRewardModelWrapper(torch.nn.Module):
         texts = self.policy_tokenizer.batch_decode(input_ids, skip_special_tokens=True)
         rm_inputs = self.rm_tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
         
+        # 越界熔断
         safe_ids = torch.where(rm_inputs["input_ids"] >= self.vocab_size, 
                                torch.tensor(self.rm_tokenizer.unk_token_id).to(self.device), 
                                rm_inputs["input_ids"])
@@ -129,9 +132,10 @@ def solve_epsilon(policy_model, ref_model, reward_model, offline_loader, device=
         Y = torch.ones(prompt_ids.shape[0]).to(device)
         
         with torch.no_grad():
-            FastLanguageModel.for_inference(policy_model) 
+            # 这里不需要显式 enable adapter，因为 policy_model 默认就是带着 LoRA 的
             log_pi = compute_log_probs(policy_model, prompt_ids, prompt_mask, a1_ids, a1_mask)
             
+            # Ref Model: 显式 disable adapter
             with policy_model.disable_adapter():
                 log_ref = compute_log_probs(policy_model, prompt_ids, prompt_mask, a1_ids, a1_mask)
             
@@ -152,33 +156,58 @@ def solve_epsilon(policy_model, ref_model, reward_model, offline_loader, device=
 # Main Loop
 # ==============================================================================
 def main():
-    # 1. 注册我们的 ExperimentArgs
     parser = HfArgumentParser((ScriptArguments, DRPOConfig, ModelConfig, ExperimentArgs))
     script_args, training_args, model_args, exp_args = parser.parse_args_into_dataclasses()
     
-    # 确定实验模式
     mode_name = "TMLE" if exp_args.enable_tmle else "Baseline_RLOO"
-    print(f"\n{'='*40}\nRunning Mode: {mode_name}\n{'='*40}\n")
+    print(f"\n{'='*40}\nRunning Mode: {mode_name} (Native HF)\n{'='*40}\n")
     
     print(f"Loading Policy Model: {model_args.model_name_or_path}")
     
-    # Load Models
-    policy_model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = model_args.model_name_or_path, max_seq_length = 2048, dtype = None, load_in_4bit = True,
+    # --- 1. Load Policy (Standard HF + BitsAndBytes) ---
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
     )
-    policy_model = FastLanguageModel.get_peft_model(
-        policy_model, r = 16, target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha = 16, lora_dropout = 0, bias = "none", use_gradient_checkpointing = True, random_state = 3407,
+    
+    policy_model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True
     )
+    
+    # 必须预处理以支持 k-bit 训练
+    policy_model = prepare_model_for_kbit_training(policy_model)
+    
+    # 挂载 LoRA
+    print("Adding LoRA adapters...")
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=16,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    policy_model = get_peft_model(policy_model, peft_config)
+    policy_model.print_trainable_parameters()
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
+    # Ref Model 逻辑：我们复用 policy_model，通过 disable_adapter() 实现
     ref_model = policy_model 
     
+    # --- 2. Load Reward Model ---
     rm_id = training_args.preference_model_id or "sfairXC/Fewer-More-Labels-3B"
+    # 这里不需要量化 config，让 wrapper 自己处理
     reward_model = SafeRewardModelWrapper(rm_id, quantization_config=None, policy_tokenizer=tokenizer)
 
-    # Dataset
+    # --- 3. Dataset ---
     print(f"Loading dataset: {script_args.dataset_name}")
     raw_dataset = load_dataset(script_args.dataset_name, split="train[:1%]")
     
@@ -206,23 +235,21 @@ def main():
     
     optimizer = AdamW(policy_model.parameters(), lr=training_args.learning_rate)
     
-    # ------------------------------------------------------------------
-    # TRAINING LOOP
-    # ------------------------------------------------------------------
+    # --- 4. Training Loop ---
     online_batch_size = 4 
     history = {"epsilon": [], "reward": [], "loss": []}
     
     for round_idx in range(exp_args.total_rounds):
         print(f"\n=== Round {round_idx}/{exp_args.total_rounds} [{mode_name}] ===")
         
-        # [KEY LOGIC] 只有开启 TMLE 时才计算 epsilon，否则设为 0
+        # [TMLE Step]
         epsilon_k = 0.0
         if exp_args.enable_tmle:
             epsilon_k = solve_epsilon(policy_model, ref_model, reward_model, offline_loader)
         
         history["epsilon"].append(epsilon_k)
         
-        # Step B: Online RLOO
+        # [RLOO Step]
         try:
             batch = next(iter(offline_loader))
         except StopIteration:
@@ -250,27 +277,35 @@ def main():
         with torch.no_grad():
             r_hat = reward_model.get_scalar_reward(outputs)
             
-            FastLanguageModel.for_inference(policy_model)
+            # Calc w
+            # Policy (with LoRA)
             log_pi = compute_log_probs(policy_model, p_ids, p_mask, resp_ids, resp_mask)
             
+            # Ref (without LoRA)
             with policy_model.disable_adapter():
                 log_ref = compute_log_probs(policy_model, p_ids, p_mask, resp_ids, resp_mask)
             
             w = torch.exp(log_pi - log_ref)
             w = torch.clamp(w, max=5.0)
             
-            # [TMLE FORMULA] 
-            # 如果 epsilon_k 为 0 (Baseline), 这里就退化为 r_hat
-            rewards = r_hat + epsilon_k * w
+            # TMLE Reward
+            raw_rewards = r_hat + epsilon_k * w
             
-            # Z-Score Normalization
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8) if rewards.std() > 1e-6 else rewards - rewards.mean()
+            # Normalize
+            rewards = raw_rewards # Copy
+            if rewards.std() > 1e-6:
+                rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+            else:
+                rewards = rewards - rewards.mean()
                 
-            print(f"   r_hat: {r_hat.mean():.2f} | w: {w.mean():.2f} | Final_R_avg: {rewards.mean():.4f}")
-            history["reward"].append(r_hat.mean().item()) # 记录 Raw Reward 来看是否真正提升
+            print(f"   r_hat: {r_hat.mean():.2f} | w: {w.mean():.2f} | Raw_Avg: {raw_rewards.mean():.4f}")
+            history["reward"].append(raw_rewards.mean().item())
 
         # Backward
         policy_model.train()
+        # 必须显式开启梯度检查点，否则backward会报错
+        policy_model.gradient_checkpointing_enable() 
+        
         full_mask = torch.cat([p_mask, resp_mask], dim=1)
         model_out = policy_model(outputs, attention_mask=full_mask)
         
@@ -284,7 +319,6 @@ def main():
         lp = torch.gather(logits_s, 2, labels_s.unsqueeze(-1)).squeeze(-1)
         slp = lp.sum(dim=1)
         
-        # Generic RLOO Advantage
         k_val = rewards.shape[0]
         if k_val > 1:
             baseline = (rewards.sum() - rewards) / (k_val - 1)
@@ -304,10 +338,8 @@ def main():
 
     # --- Plotting ---
     plt.figure(figsize=(10, 5))
-    plt.plot(history["reward"], label=f"{mode_name} (Raw r_hat)")
+    plt.plot(history["reward"], label=f"{mode_name} Reward")
     plt.title(f"Performance: {mode_name}")
-    plt.xlabel("Rounds"); plt.ylabel("Original Reward Score")
-    plt.legend()
     plt.savefig(os.path.join(training_args.output_dir, f"result_{mode_name}.png"))
     print("Done.")
 
