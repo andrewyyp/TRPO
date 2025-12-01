@@ -236,7 +236,13 @@ def main():
     optimizer = AdamW(policy_model.parameters(), lr=training_args.learning_rate)
     
     # --- 4. Training Loop ---
-    online_batch_size = 4 
+    # 既然你还有 9GB 显存，直接上 K=4，甚至可以试 K=8
+    online_batch_size = 8  
+    
+    # [强烈建议] 开启梯度检查点 (Gradient Checkpointing)
+    # 这行代码能用 "时间换空间"，虽然慢一丁点，但能让显存占用砍半，
+    # 这样你甚至能跑 K=16！
+    policy_model.gradient_checkpointing_enable()
     history = {"epsilon": [], "reward": [], "loss": []}
     
     for round_idx in range(exp_args.total_rounds):
@@ -337,11 +343,36 @@ def main():
         history["loss"].append(loss.item())
 
     # --- Plotting ---
-    plt.figure(figsize=(10, 5))
+    print("Training Finished. Generating Plots...")
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
     plt.plot(history["reward"], label=f"{mode_name} Reward")
     plt.title(f"Performance: {mode_name}")
-    plt.savefig(os.path.join(training_args.output_dir, f"result_{mode_name}.png"))
-    print("Done.")
+    plt.xlabel("Rounds"); plt.ylabel("Reward (Raw)")
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history["loss"], label=f"{mode_name} Loss", color='orange')
+    plt.title("Loss Trajectory")
+    plt.xlabel("Rounds"); plt.ylabel("Loss")
+    plt.legend()
+    
+    # [FIX] 强制创建输出目录，防止 FileNotFoundError
+    if not os.path.exists(training_args.output_dir):
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        print(f"Created directory: {training_args.output_dir}")
+    
+    save_path = os.path.join(training_args.output_dir, f"result_{mode_name}.png")
+    plt.savefig(save_path)
+    print(f"Plot saved to: {save_path}")
+
+    # [OPTIONAL] 顺便把数据也存下来，万一画图丑还能重画
+    import json
+    json_path = os.path.join(training_args.output_dir, f"history_{mode_name}.json")
+    with open(json_path, 'w') as f:
+        json.dump(history, f)
+    print(f"History saved to: {json_path}")
 
 if __name__ == "__main__":
     main()
