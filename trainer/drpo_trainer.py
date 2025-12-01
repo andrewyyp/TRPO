@@ -627,13 +627,29 @@ class DRPOTrainer(Trainer):
 
         # Get the logps of the completions from the model
         output = model(prompt_completion_ids, attention_mask=prompt_completion_mask)
-
-        # There is 1 offset, because the model predict the next token
-        logits = output.logits[:, max(0, prompt_ids.size(1) - 1) : -1]
+        
+        # [FIX] Robust Slicing
+        # Causal LM: logits[:, i] predicts input_ids[:, i+1]
+        # We want logits that predict completion_ids.
+        # completion starts at index: prompt_ids.size(1)
+        # So we need logits starting from: prompt_ids.size(1) - 1
+        
+        start_idx = max(0, prompt_ids.size(1) - 1)
+        # Shift logits: remove the last logit because we don't have a label for it
+        logits = output.logits[:, start_idx : -1] 
+        
+        # [CRITICAL FIX] Align lengths!
+        # 有时候 logits 和 completion_ids 的长度会差 1，强制对齐
+        min_len = min(logits.size(1), completion_ids.size(1))
+        
+        logits = logits[:, :min_len, :]
+        completion_ids = completion_ids[:, :min_len]
+        
         logits /= temperature + 1e-7
+        
         # Take the completion tokens logp
         logps = selective_log_softmax(logits, completion_ids)
-        # logps = torch.take_along_dim(logits.log_softmax(dim=-1), completion_ids.unsqueeze(-1), dim=2).squeeze(-1)
+        
         return logps
     
     def training_step(self, model:nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int]=None) -> torch.Tensor:
