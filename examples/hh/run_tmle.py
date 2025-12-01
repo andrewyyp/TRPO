@@ -216,6 +216,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
+    tokenizer.padding_side = "left"
+
     # 2. Load Reward Model (With Tokenizer fix)
     rm_id = training_args.preference_model_id
     if rm_id is None:
@@ -338,6 +340,9 @@ def main():
             
             # [TMLE FORMULA]
             rewards = r_hat + epsilon_k * w
+
+            if rewards.std() > 1e-6: # 防止方差为0除以0
+                rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
             
             # 打印调试信息
             print(f"   r_hat: {r_hat.mean().item():.4f}, w: {w.mean().item():.4f}, Final Reward: {rewards.mean().item():.4f}")
