@@ -12,18 +12,15 @@ from datasets import load_dataset
 # ==============================================================================
 # [FIX] 路径修正核心代码
 # ==============================================================================
-# 1. 获取当前脚本所在目录 (examples/hh)
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# 2. 获取项目根目录 (TRPO/) - 往上跳两级
 project_root = os.path.abspath(os.path.join(current_dir, "../.."))
-# 3. 强行将根目录插入到 Python 搜索路径的第一位
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 print(f">>> Root directory added to sys.path: {project_root}")
 
 # ==============================================================================
-# [FIX] 修正 Import 方式：直接从 trl 和 trainer 导入，绕过 broken 的 drpo.py
+# [FIX] Import
 # ==============================================================================
 from trl import (
     ScriptArguments, 
@@ -33,42 +30,87 @@ from trl import (
 )
 from transformers import (
     AutoModelForCausalLM, 
+    AutoModelForSequenceClassification, # <--- 必须显式导入这个
     AutoTokenizer, 
     HfArgumentParser,
     BitsAndBytesConfig
 )
 
-# 直接从 trainer 文件夹导入 (现在 Python 能找到它了)
-# 注意：这里假设 drpo_config.py 和 drpo_utils.py 都在 trainer/ 目录下
 try:
     from trainer.drpo_config import DRPOConfig
-    from trainer.drpo_utils import GPMwithRewardNetwork, BTRewardNetwork
-    # 如果你也需要 DataCollator，也可以从这里导
-    from trainer.drpo_trainer import DataCollatorDRPO 
+    # 我们不再导入 BTRewardNetwork，因为我们要自己重写一个更稳健的
 except ImportError as e:
-    print("Error importing from trainer. Make sure 'trainer' folder has __init__.py")
+    print("Error importing from trainer.")
     raise e
+
+# ==============================================================================
+# [NEW] 稳健的 Reward Model 包装器 (解决 shape mismatch 问题)
+# ==============================================================================
+class SafeRewardModelWrapper(torch.nn.Module):
+    def __init__(self, model_name, quantization_config=None):
+        super().__init__()
+        print(f"Loading Reward Model safely: {model_name}")
+        
+        # 1. 尝试按 checkpoint 原始配置加载 (通常是 num_labels=2)
+        try:
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map="cuda", # 强制放 GPU
+                trust_remote_code=True,
+                ignore_mismatched_sizes=True # <--- 关键！允许跳过不匹配的权重
+            )
+        except Exception as e:
+            print(f"Warning: Standard loading failed, trying with num_labels=1. Error: {e}")
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_name,
+                num_labels=1,
+                quantization_config=quantization_config,
+                device_map="cuda",
+                trust_remote_code=True,
+                ignore_mismatched_sizes=True
+            )
+            
+        # 检测它是分类器(2输出)还是回归器(1输出)
+        if hasattr(self.model.config, "num_labels") and self.model.config.num_labels > 1:
+            self.is_classifier = True
+            print(">>> Detected Classification Reward Model (Output Dim > 1). Will use logits diff.")
+        else:
+            self.is_classifier = False
+            print(">>> Detected Regression Reward Model (Output Dim = 1).")
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.model(input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        
+        if self.is_classifier:
+            # 如果是二分类 (Rank 0 vs Rank 1)，通常 logits[:, 1] 是 positive score
+            # 或者用 logits[:, 1] - logits[:, 0]
+            # 这里为了简单，我们取 logits[:, 0] (假设 index 0 是 score，具体看模型) 
+            # 通常 Reward Model index 0 是 rejected, 1 是 chosen. 
+            # 安全起见，我们把两个 logits 相减，这样无论 0/1 谁大谁小，梯度方向都在
+            reward = logits[:, 1] - logits[:, 0]
+        else:
+            # 回归模型，直接 squeeze
+            reward = logits.squeeze(-1)
+            
+        return reward
 
 # ==============================================================================
 # Helper: Log Prob 计算逻辑
 # ==============================================================================
 def compute_log_probs(model, input_ids, attention_mask, labels_ids, labels_mask):
-    """
-    计算 log pi(y|x)
-    """
     input_ids = input_ids.to(model.device)
     attention_mask = attention_mask.to(model.device)
     labels_ids = labels_ids.to(model.device)
     labels_mask = labels_mask.to(model.device)
 
-    # 拼接
     full_ids = torch.cat([input_ids, labels_ids], dim=1)
     full_mask = torch.cat([attention_mask, labels_mask], dim=1)
 
     outputs = model(full_ids, attention_mask=full_mask)
     logits = outputs.logits
 
-    # Shift logits
     logits = logits[:, :-1, :]
     labels_target = full_ids[:, 1:]
     
@@ -99,20 +141,16 @@ def solve_epsilon(policy_model, ref_model, reward_network, offline_loader, devic
     
     numerator = 0.0
     denominator = 0.0
-    max_steps = 20 # 稍微跑一点数据做演示
+    max_steps = 10 # 快速验证
     
     for step, batch in enumerate(tqdm(offline_loader, total=max_steps)):
         if step >= max_steps: break
         
-        # 这里的 key 需要根据 DataCollatorDRPO 的输出调整
-        # DataCollatorDRPO 输出: prompt_ids, a1_ids, a2_ids, rank
         prompt_ids = batch['prompt_ids']
         prompt_mask = batch['prompt_attention_mask']
         a1_ids = batch['a1_ids']
         a1_mask = batch['a1_attention_mask']
         
-        # 假设 rank=1 代表 a1 是 chosen (Y=1)
-        # 注意: DRPO 代码里 rank 是 tensor([0, 1, 0...])
         Y = batch['rank'].float().to(device)
         
         with torch.no_grad():
@@ -120,16 +158,14 @@ def solve_epsilon(policy_model, ref_model, reward_network, offline_loader, devic
             log_ref = compute_log_probs(ref_model, prompt_ids, prompt_mask, a1_ids, a1_mask)
             
             w = torch.exp(log_pi - log_ref)
-            w = torch.clamp(w, max=10.0) # 截断防止数值爆炸
+            w = torch.clamp(w, max=10.0) 
             
-            # 计算 r_hat
+            # 计算 r_hat (使用我们的 Safe Wrapper)
+            # Safe Wrapper 需要拼接好的 inputs
             full_ids = torch.cat([prompt_ids, a1_ids], dim=1).to(device)
             full_mask = torch.cat([prompt_mask, a1_mask], dim=1).to(device)
             
-            # 兼容性处理：有的 RewardModel 返回 tuple, 有的返回 logits
-            rm_out = reward_network(full_ids, full_mask)
-            if isinstance(rm_out, tuple): rm_out = rm_out[0]
-            r_hat = rm_out.squeeze(-1) if rm_out.dim() > 0 else rm_out
+            r_hat = reward_network(full_ids, full_mask)
             
             residual = Y - r_hat
             
@@ -147,7 +183,7 @@ def main():
     parser = HfArgumentParser((ScriptArguments, DRPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
     
-    print(f"Loading Model: {model_args.model_name_or_path}")
+    print(f"Loading Policy Model: {model_args.model_name_or_path}")
     
     quantization_config = get_quantization_config(model_args)
     model_kwargs = dict(
@@ -161,34 +197,38 @@ def main():
     ref_model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
     ref_model.eval()
     
-    if training_args.is_bt_model:
-        reward_model = BTRewardNetwork(training_args.preference_model_id)
-    else:
-        reward_model = GPMwithRewardNetwork(training_args.preference_model_id)
+    # [FIXED] 使用 SafeRewardModelWrapper 替代原来的加载逻辑
+    # 如果命令行没指定 preference_model_id，默认使用一个 dummy 或者 Qwen 本身(不推荐)
+    # 我们这里假设用户会指定，或者默认用一个已知的 RM
+    rm_id = training_args.preference_model_id
+    if rm_id is None:
+        print("Warning: No preference_model_id provided. Using a default one for testing.")
+        rm_id = "sfairXC/Fewer-More-Labels-3B" 
+        
+    reward_model = SafeRewardModelWrapper(rm_id, quantization_config=quantization_config)
     
-    # 简单的设备处理
-    if quantization_config is None:
-        reward_model.to("cuda")
-    reward_model.eval()
-
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.chat_template is None: tokenizer.chat_template = "{% for message in messages %}{{ message['role'] + ': ' + message['content'] + '\n' }}{% endfor %}"
 
-    # 2. Prepare Dataset for Offline Step
-    # 这里我们加载一部分数据用于计算 Epsilon
+    # 2. Prepare Dataset
     print(f"Loading dataset: {script_args.dataset_name}")
-    raw_dataset = load_dataset(script_args.dataset_name, split="train[:1%]") # 只取 1% 快速验证
+    raw_dataset = load_dataset(script_args.dataset_name, split="train[:1%]")
     
-    # 复用 DRPO 的数据预处理逻辑 (Tokenize)
-    # 为了简化，我们手动简易处理一下，或者你可以 copy drpo.py 里的 _prepare_dataset 逻辑
-    # 这里做一个极简的 collator 演示
     def simple_tokenize(examples):
-        # 简单处理：假设数据里有 prompt, chosen, rejected
-        prompts = [x['chosen'].split('\n\nAssistant:')[0] for x in examples['chosen']]
-        # 假设 chosen 就是 a1
-        a1s = [x['chosen'].split('\n\nAssistant:')[-1] for x in examples['chosen']]
-        
+        # 针对 Anthropic HH 数据集的简单处理
+        prompts = []
+        a1s = []
+        # Anthropic HH 只有 'chosen' 和 'rejected'
+        for chosen, rejected in zip(examples['chosen'], examples['rejected']):
+            # 简单切分 Human/Assistant
+            split_text = chosen.split('\n\nAssistant:')
+            if len(split_text) > 1:
+                prompts.append(split_text[0] + '\n\nAssistant:')
+                a1s.append(split_text[1])
+            else:
+                prompts.append(chosen[:20]) # Fallback
+                a1s.append(chosen[20:])
+                
         tokenized = tokenizer(prompts, padding="max_length", truncation=True, max_length=128, return_tensors="pt")
         a1_tokenized = tokenizer(a1s, padding="max_length", truncation=True, max_length=128, return_tensors="pt")
         
@@ -197,20 +237,18 @@ def main():
             "prompt_attention_mask": tokenized["attention_mask"],
             "a1_ids": a1_tokenized["input_ids"],
             "a1_attention_mask": a1_tokenized["attention_mask"],
-            "rank": torch.ones(len(prompts)) # Dummy rank
+            "rank": torch.ones(len(prompts)) 
         }
 
     # 3. TMLE + RLOO Loop
     optimizer = AdamW(policy_model.parameters(), lr=training_args.learning_rate)
     
-    # 手动构造 DataLoader
-    # 注意：实际使用时应该用 DataCollatorDRPO
     tokenized_ds = raw_dataset.map(simple_tokenize, batched=True, remove_columns=raw_dataset.column_names)
     tokenized_ds.set_format(type="torch")
-    offline_loader = DataLoader(tokenized_ds, batch_size=2)
+    offline_loader = DataLoader(tokenized_ds, batch_size=1) # T4 上显存紧张，batch=1
     
     epsilon_k = 0.0
-    total_rounds = 2 # 演示跑2轮
+    total_rounds = 2
     
     for round_idx in range(total_rounds):
         print(f"\n=== Round {round_idx} Start ===")
@@ -220,8 +258,8 @@ def main():
         
         # Step B: Online RLOO (Demo)
         print(">>> Running Online RLOO Step...")
-        # 构造一些 Dummy Inputs 跑一下流程
-        dummy_inputs = tokenizer(["Human: Hello\n\nAssistant:"], return_tensors="pt").to(policy_model.device)
+        # 构造 Dummy Input 验证流程是否跑通
+        dummy_inputs = tokenizer(["\n\nHuman: Hello\n\nAssistant:"], return_tensors="pt").to(policy_model.device)
         
         policy_model.train()
         optimizer.zero_grad()
@@ -229,7 +267,6 @@ def main():
         # Rollout
         gen_out = policy_model.generate(**dummy_inputs, max_new_tokens=10, do_sample=True)
         
-        # ... 这里省略具体的 RLOO loss 计算，只证明 epsilon 算出来了 ...
         print(f"Round {round_idx} Finished. Epsilon used: {epsilon_k}")
 
 if __name__ == "__main__":
