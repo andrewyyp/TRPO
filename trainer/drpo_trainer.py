@@ -628,7 +628,7 @@ class DRPOTrainer(Trainer):
         # Get the logps of the completions from the model
         output = model(prompt_completion_ids, attention_mask=prompt_completion_mask)
         
-        # [FIX] Robust Slicing
+        # [FIX] Robust Slicing ok
         # Causal LM: logits[:, i] predicts input_ids[:, i+1]
         # We want logits that predict completion_ids.
         # completion starts at index: prompt_ids.size(1)
