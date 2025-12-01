@@ -259,21 +259,126 @@ def main():
     offline_loader = DataLoader(tokenized_ds, batch_size=1) 
     
     # 4. Loop
+    # ... (前面的代码不变) ...
+    
+    # 3. TMLE + RLOO Loop
     optimizer = AdamW(policy_model.parameters(), lr=training_args.learning_rate)
-    epsilon_k = 0.0
-    total_rounds = 2
+    
+    # 这里的 batch_size 决定了 RLOO 的 K (K samples per prompt)
+    # T4 显存小，我们设 batch_size=2 (即 K=2) 或者 4
+    online_batch_size = 2 
+    
+    # [关键修改] 增加轮数
+    total_rounds = 50 
     
     for round_idx in range(total_rounds):
-        print(f"\n=== Round {round_idx} Start ===")
+        print(f"\n=== Round {round_idx}/{total_rounds} Start ===")
         
+        # -----------------------------------------------------
+        # Step A: TMLE Targeting (更新校正项 Epsilon)
+        # -----------------------------------------------------
         epsilon_k = solve_epsilon(policy_model, ref_model, reward_model, offline_loader)
         
-        print(">>> Running Online RLOO Step...")
-        dummy_inputs = tokenizer(["\n\nHuman: Hello\n\nAssistant:"], return_tensors="pt").to(policy_model.device)
+        # -----------------------------------------------------
+        # Step B: Online RLOO Training (真正的参数更新)
+        # -----------------------------------------------------
         policy_model.train()
         optimizer.zero_grad()
-        gen_out = policy_model.generate(**dummy_inputs, max_new_tokens=10, do_sample=True)
-        print(f"Round {round_idx} Finished. Epsilon used: {epsilon_k}")
+        
+        # 1. 准备 Prompt (这里简单复用 offline data 的 prompt，实际可以用单独的 prompt set)
+        try:
+            batch = next(iter(offline_loader))
+        except StopIteration:
+            offline_loader = DataLoader(tokenized_ds, batch_size=online_batch_size)
+            batch = next(iter(offline_loader))
+            
+        prompts = batch['prompt_ids'].to(policy_model.device)
+        prompts_mask = batch['prompt_attention_mask'].to(policy_model.device)
+        
+        # 2. Rollout: 生成回复 (K samples)
+        # 我们把 prompts 重复 K 次来做 RLOO
+        # 但 DataLoader 已经给了 batch_size 个样本，我们假设它们是不同的 prompt
+        # 为了 RLOO，我们需要对 *同一个* prompt 生成多个回答。
+        # 简单起见，我们取第1个 prompt，重复 online_batch_size 次
+        
+        current_prompt = prompts[0].unsqueeze(0).repeat(online_batch_size, 1)
+        current_mask = prompts_mask[0].unsqueeze(0).repeat(online_batch_size, 1)
+        
+        print(f">>> Generating {online_batch_size} responses...")
+        with torch.no_grad():
+            outputs = policy_model.generate(
+                input_ids=current_prompt,
+                attention_mask=current_mask,
+                max_new_tokens=64,
+                do_sample=True,
+                temperature=0.7,
+                pad_token_id=tokenizer.pad_token_id
+            )
+            
+        # 3. 计算 Reward (带 TMLE 修正)
+        # r_tmle = r_hat + epsilon * (pi / pi_ref)
+        
+        # (a) 准备 response 部分用于计算 log_prob
+        # outputs 包含了 prompt + response
+        response_ids = outputs[:, current_prompt.shape[1]:]
+        # 构造 attention mask (假设没有 padding，或者简单处理)
+        response_mask = torch.ones_like(response_ids)
+        
+        with torch.no_grad():
+            # 计算 r_hat (Reward Model Score)
+            # SafeRewardModelWrapper 接受完整 ids (prompt+response)
+            r_hat = reward_model(outputs, None) # batch_size
+            
+            # 计算 Density Ratio (w = pi / pi_ref)
+            # 注意：我们要计算的是 *response* 的 log prob
+            log_pi = compute_log_probs(policy_model, current_prompt, current_mask, response_ids, response_mask)
+            log_ref = compute_log_probs(ref_model, current_prompt, current_mask, response_ids, response_mask)
+            w = torch.exp(log_pi - log_ref)
+            w = torch.clamp(w, max=10.0) # 截断保护
+            
+            # [TMLE FORMULA]
+            rewards = r_hat + epsilon_k * w
+            
+            # 打印调试信息
+            print(f"   r_hat: {r_hat.mean().item():.4f}, w: {w.mean().item():.4f}, Final Reward: {rewards.mean().item():.4f}")
+
+        # 4. RLOO Loss 计算 & Backward
+        # 既然我们已经有了 generated tokens，我们需要再 forward 一次拿梯度
+        # 注意：Unsloth/Peft 需要 enable_adapter
+        
+        # 计算 Log Probs (带梯度)
+        # 这里为了省事，直接用刚才的 compute_log_probs 逻辑，但不要 torch.no_grad
+        full_output_mask = torch.cat([current_mask, response_mask], dim=1)
+        model_out = policy_model(outputs, attention_mask=full_output_mask)
+        logits = model_out.logits[:, :-1, :]
+        labels = outputs[:, 1:]
+        
+        # 提取 response 部分的 log_prob
+        start_idx = current_prompt.shape[1] - 1
+        resp_logits = logits[:, start_idx:, :]
+        resp_labels = labels[:, start_idx:]
+        
+        token_log_probs = F.log_softmax(resp_logits, dim=-1)
+        token_log_probs = torch.gather(token_log_probs, 2, resp_labels.unsqueeze(-1)).squeeze(-1)
+        sentence_log_probs = token_log_probs.sum(dim=1)
+        
+        # RLOO Advantage: (Reward - Others_Mean)
+        # Vectorized implementation
+        k = len(rewards)
+        if k > 1:
+            rloo_baseline = (rewards.sum() - rewards) / (k - 1)
+            advantages = rewards - rloo_baseline
+        else:
+            advantages = rewards - rewards.mean() # Fallback to standard baseline if K=1
+            
+        # Loss = - log_prob * advantage
+        loss = - (sentence_log_probs * advantages).mean()
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
+        optimizer.step()
+        
+        print(f">>> Step Loss: {loss.item():.4f}")
 
 if __name__ == "__main__":
     main()
