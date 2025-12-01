@@ -28,7 +28,7 @@ from transformers import (
 from trainer.drpo_config import DRPOConfig
 
 # ==============================================================================
-# [FIXED] 智能 Reward Model Wrapper (带 Tokenizer 转换)
+# [FIXED v2] 智能 Reward Model Wrapper (带越界熔断机制)
 # ==============================================================================
 class SafeRewardModelWrapper(torch.nn.Module):
     def __init__(self, model_name, quantization_config=None, policy_tokenizer=None):
@@ -66,15 +66,17 @@ class SafeRewardModelWrapper(torch.nn.Module):
             self.is_classifier = True
         else:
             self.is_classifier = False
+            
+        # [NEW] 获取 Reward Model 的词表上限
+        self.vocab_size = self.model.config.vocab_size
+        print(f">>> Reward Model Vocab Size: {self.vocab_size}")
 
     def forward(self, input_ids, attention_mask):
-        # [CRITICAL FIX] Tokenizer 转换逻辑
         # 1. Detokenize: 把 Policy (Qwen) 的 ID 转回 Text
-        # skip_special_tokens=True 很重要，防止特殊符号把 RM 搞晕
+        # 必须处理，因为 Qwen 的 ID 空间和 RoBERTa 完全不同
         texts = self.policy_tokenizer.batch_decode(input_ids, skip_special_tokens=True)
         
-        # 2. Retokenize: 把 Text 转成 Reward Model (RoBERTa) 的 ID
-        # padding=True, truncation=True 防止长度爆掉 (RoBERTa max 512)
+        # 2. Retokenize: 转成 RoBERTa ID
         rm_inputs = self.rm_tokenizer(
             texts, 
             padding=True, 
@@ -83,12 +85,25 @@ class SafeRewardModelWrapper(torch.nn.Module):
             return_tensors="pt"
         ).to(self.device)
         
+        # [CRITICAL FIX] 物理熔断：强制将越界 ID 替换为 UNK
+        # RoBERTa 的 vocab size 通常是 50265
+        # 如果 rm_tokenizer 偶尔发疯产生了大 ID，这里直接拦截
+        rm_input_ids = rm_inputs["input_ids"]
+        rm_attention_mask = rm_inputs["attention_mask"]
+        
+        # 将所有 >= vocab_size 的 ID 替换为 unk_token_id (通常是 3)
+        # 或者 pad_token_id (1)
+        safe_input_ids = torch.where(
+            rm_input_ids >= self.vocab_size, 
+            torch.tensor(self.rm_tokenizer.unk_token_id).to(self.device), 
+            rm_input_ids
+        )
+        
         # 3. Forward Pass
-        outputs = self.model(**rm_inputs)
+        outputs = self.model(safe_input_ids, attention_mask=rm_attention_mask)
         logits = outputs.logits
         
         if self.is_classifier:
-            # 取差值作为 Reward
             reward = logits[:, 1] - logits[:, 0]
         else:
             reward = logits.squeeze(-1)
